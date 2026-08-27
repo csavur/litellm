@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Optional
 
@@ -22,7 +23,9 @@ class StreamTransformSink:
     accumulated text per choice (``mutated_text_per_choice``, keyed by
     ``StreamingChoices.index``) and the per-choice trailing holdback the guardrail
     requested (``holdback_per_choice``, from ``stream_holdback_chars``) are
-    reported here instead of in place. Only the OpenAI chat handler populates this
+    reported here instead of in place. ``mutated_reasoning_per_choice`` carries the
+    guardrailed reasoning on the same key; it has no holdback of its own, so a
+    rewrite of already-emitted reasoning fails closed via the caller's underflow check. Only the OpenAI chat handler populates this
     today; the hook passes a fresh sink per round and reads it afterwards. A
     mutable dataclass is deliberate: it is a write-once output parameter for a
     single call, not shared state.
@@ -30,6 +33,7 @@ class StreamTransformSink:
 
     mutated_text_per_choice: dict[int, str] = field(default_factory=dict)
     holdback_per_choice: dict[int, int] = field(default_factory=dict)
+    mutated_reasoning_per_choice: Mapping[int, str] = field(default_factory=dict)
 
 
 class BaseTranslation(ABC):

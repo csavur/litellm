@@ -14,7 +14,10 @@ Pattern Overview:
 This pattern can be replicated for other message formats (e.g., Anthropic).
 """
 
-from typing import TYPE_CHECKING, Any, Final, Union, cast
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Union, assert_never, cast
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -33,7 +36,12 @@ from litellm.llms.base_llm.guardrail_translation.utils import (
     scoped_structured_message_indices,
 )
 from litellm.main import stream_chunk_builder
-from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
+from litellm.types.llms.openai import (
+    AllMessageValues,
+    ChatCompletionRedactedThinkingBlock,
+    ChatCompletionThinkingBlock,
+    ChatCompletionToolParam,
+)
 from litellm.types.proxy.guardrails.guardrail_hooks.generic_guardrail_api import (
     coerce_stream_holdback_value,
 )
@@ -47,6 +55,34 @@ from litellm.types.utils import (
 
 if TYPE_CHECKING:
     from litellm.integrations.custom_guardrail import CustomGuardrail
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningContentTarget:
+    choice_idx: int
+
+
+@dataclass(frozen=True, slots=True)
+class ThinkingBlockTarget:
+    choice_idx: int
+    block_idx: int
+
+
+ReasoningTarget = ReasoningContentTarget | ThinkingBlockTarget
+
+
+@dataclass(frozen=True, slots=True)
+class ScannedReasoning:
+    """One reasoning text and every field it has to be written back to.
+
+    Providers commonly set ``reasoning_content`` to the same string as the sole
+    thinking block, so one scanned text can carry several targets. Sending it once
+    keeps the guardrail from being billed twice and stops a non-deterministic
+    guardrail from returning two different rewrites of the same text.
+    """
+
+    text: str
+    targets: tuple[ReasoningTarget, ...]
 
 
 class OpenAIChatCompletionsHandler(BaseTranslation):
@@ -371,8 +407,15 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                 tool_call_task_mappings=tool_call_task_mappings,
             )
 
+        scanned_reasoning: Final = tuple(
+            entry
+            for choice_idx, choice in enumerate(response.choices)
+            for entry in self._extract_output_reasoning(choice=choice, choice_idx=choice_idx)
+        )
+        reasoning_texts_to_check: Final = [entry.text for entry in scanned_reasoning]
+
         # Step 2: Apply guardrail to all texts and tool calls in batch
-        if texts_to_check or tool_calls_to_check:
+        if texts_to_check or reasoning_texts_to_check or tool_calls_to_check:
             # Use the real request_data if provided (proxy path), otherwise
             # create a standalone dict (SDK / direct-call path).
             if request_data is None:
@@ -392,6 +435,8 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                 inputs["images"] = images_to_check
             if tool_calls_to_check:
                 inputs["tool_calls"] = tool_calls_to_check
+            if reasoning_texts_to_check:
+                inputs["reasoning_texts"] = reasoning_texts_to_check
             # Include model information from the response if available
             if hasattr(response, "model") and response.model:
                 inputs["model"] = response.model
@@ -404,6 +449,10 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             )
 
             guardrailed_texts: Final = guardrailed_inputs.get("texts", [])
+            guardrailed_reasoning_texts: Final = self._aligned_guardrailed_reasoning(
+                returned=guardrailed_inputs.get("reasoning_texts"),
+                sent_count=len(scanned_reasoning),
+            )
             returned_tool_calls: Final = guardrailed_inputs.get("tool_calls")
             guardrailed_tool_calls: Final[list[dict[str, Any]]] = (
                 cast(list[dict[str, Any]], returned_tool_calls)
@@ -419,7 +468,15 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     task_mappings=text_task_mappings,
                 )
 
-            # Step 4: Apply guardrailed tool calls back to response
+            # Step 4: Map guardrailed reasoning back to the response
+            if guardrailed_reasoning_texts is not None:
+                await self._apply_guardrail_responses_to_output_reasoning(
+                    response=response,
+                    responses=guardrailed_reasoning_texts,
+                    scanned=scanned_reasoning,
+                )
+
+            # Step 5: Apply guardrailed tool calls back to response
             if guardrailed_tool_calls:
                 await self._apply_guardrail_responses_to_output_tool_calls(
                     response=response,
@@ -493,13 +550,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         terminate the stream. Text rewrites are not propagated to the client here
         (see ``_process_streaming_transform`` for the incremental_diff path)."""
         # check if the stream has ended
-        has_stream_ended = False
-        for chunk in responses_so_far:
-            if chunk.choices and chunk.choices[0].finish_reason is not None:
-                has_stream_ended = True
-                break
-
-        if has_stream_ended:
+        if self._stream_has_ended(responses_so_far):
             # convert to model response
             model_response: Final = cast(
                 ModelResponse,
@@ -544,6 +595,16 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             texts_to_check.append(combined_text)
             task_mappings.append((map_choice_idx, map_content_idx))
 
+        # Reasoning rides along so an in-flight BLOCK can see it, but is never written
+        # back: like the text rewrites below, this path's mutations land on chunks the
+        # caller has already deep-copied, so they never reach the client. It does not
+        # trigger a round on its own either. A reasoning model thinks for many chunks
+        # before its first content token, and calling the guardrail once per sampled
+        # chunk with an empty ``texts`` list bills a round trip per chunk and makes an
+        # output-side assertion evaluate the empty string. The reassembled response at
+        # end of stream carries the reasoning to ``process_output_response`` regardless.
+        reasoning_texts_to_check: Final = self._streaming_reasoning_texts(responses_so_far)
+
         # Step 3: Apply guardrail to all combined texts in batch
         if texts_to_check:
             # Use the real request_data if provided (proxy path), otherwise
@@ -560,12 +621,12 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                 if user_metadata:
                     request_data["litellm_metadata"] = user_metadata
 
-            inputs: Final = GenericGuardrailAPIInputs(texts=texts_to_check)
-            if images_to_check:
-                inputs["images"] = images_to_check
-            # Include model information from the first response if available
-            if responses_so_far and hasattr(responses_so_far[0], "model") and responses_so_far[0].model:
-                inputs["model"] = responses_so_far[0].model
+            inputs: Final = self._streaming_guardrail_inputs(
+                texts=texts_to_check,
+                images=images_to_check,
+                reasoning_texts=reasoning_texts_to_check,
+                responses_so_far=responses_so_far,
+            )
             guardrailed_inputs: Final = await guardrail_to_apply.apply_guardrail(
                 inputs=inputs,
                 request_data=request_data,
@@ -634,9 +695,15 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         always sees consistent input) and hands the result back out of band.
         """
         raw_by_index: Final = self._accumulate_string_content_by_choice_index(responses_so_far)
-        if not raw_by_index:
+        raw_reasoning_by_index: Final = self._accumulate_reasoning_by_choice_index(responses_so_far)
+        # A reasoning-only round is not worth a guardrail call: it would hand over an
+        # empty ``texts`` list once per sampled chunk for the whole thinking phase. Wait
+        # for the first content token, or for the end of the stream so a response that
+        # is nothing but reasoning is still scanned once.
+        if not raw_by_index and not (raw_reasoning_by_index and self._stream_has_ended(responses_so_far)):
             sink.mutated_text_per_choice = {}
             sink.holdback_per_choice = {}
+            sink.mutated_reasoning_per_choice = {}
             return
 
         # Fix #2 — sort by StreamingChoices.index so an n>1 stream that emits
@@ -657,7 +724,12 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             if user_metadata:
                 request_data["litellm_metadata"] = user_metadata
 
+        reasoning_indices: Final = sorted(raw_reasoning_by_index.keys())
+        reasoning_to_check: Final = [raw_reasoning_by_index[i] for i in reasoning_indices]
+
         inputs: Final = GenericGuardrailAPIInputs(texts=texts_to_check)
+        if reasoning_to_check:
+            inputs["reasoning_texts"] = reasoning_to_check
         if responses_so_far and getattr(responses_so_far[0], "model", None):
             inputs["model"] = responses_so_far[0].model
         guardrailed_inputs: Final = await guardrail_to_apply.apply_guardrail(
@@ -682,6 +754,15 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                 len(texts_to_check),
             )
 
+        # Only reasoning the guardrail actually vetted is put on the wire. A guardrail
+        # that ignores ``reasoning_texts`` gets the previous behaviour, where this path
+        # emitted no reasoning at all, rather than having raw chain of thought forwarded
+        # under a redaction it never applied.
+        guardrailed_reasoning: Final = self._aligned_guardrailed_reasoning(
+            returned=guardrailed_inputs.get("reasoning_texts"),
+            sent_count=len(reasoning_to_check),
+        )
+
         holdback: Final = guardrailed_inputs.get("stream_holdback_chars") or []
         sink.mutated_text_per_choice = {
             idx: returned_texts[i] for i, idx in enumerate(indices) if i < len(returned_texts)
@@ -689,6 +770,11 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         sink.holdback_per_choice = {
             indices[i]: coerce_stream_holdback_value(holdback[i]) for i in range(len(indices)) if i < len(holdback)
         }
+        sink.mutated_reasoning_per_choice = (
+            {}
+            if guardrailed_reasoning is None
+            else {idx: guardrailed_reasoning[i] for i, idx in enumerate(reasoning_indices)}
+        )
 
     def _combine_streaming_texts(
         self, responses_so_far: list["ModelResponseStream"]
@@ -740,9 +826,119 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
 
         return combined_texts
 
+    @staticmethod
+    def _reasoning_content(choice: Choices | StreamingChoices) -> str | None:
+        """Read ``reasoning_content`` off a choice.
+
+        ``Message``/``Delta`` delete the attribute entirely when it is unset, so a
+        plain attribute access would raise instead of returning ``None``.
+        """
+        source: Final = choice.message if isinstance(choice, litellm.Choices) else choice.delta
+        reasoning: Final = getattr(source, "reasoning_content", None)
+        return reasoning if isinstance(reasoning, str) else None
+
+    @staticmethod
+    def _thinking_blocks(
+        choice: Choices | StreamingChoices,
+    ) -> tuple[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock, ...]:
+        """Read ``thinking_blocks`` off a choice (see ``_reasoning_content`` on why getattr)."""
+        source: Final = choice.message if isinstance(choice, litellm.Choices) else choice.delta
+        blocks: Final = getattr(source, "thinking_blocks", None)
+        return tuple(blocks) if isinstance(blocks, list) else ()
+
+    @staticmethod
+    def _thinking_block_text(block: object) -> str | None:
+        """Readable text of a thinking block. ``redacted_thinking`` blocks carry only
+        opaque encrypted ``data``, so there is nothing for a guardrail to scan."""
+        if not isinstance(block, dict) or block.get("type") == "redacted_thinking":
+            return None
+        thinking: Final = block.get("thinking")
+        return thinking if isinstance(thinking, str) and thinking else None
+
+    @classmethod
+    def _has_reasoning_content(cls, choice: Choices | StreamingChoices) -> bool:
+        if cls._reasoning_content(choice):
+            return True
+        return any(cls._thinking_block_text(block) for block in cls._thinking_blocks(choice))
+
+    @staticmethod
+    def _aligned_guardrailed_reasoning(returned: object, sent_count: int) -> tuple[str, ...] | None:
+        """Accept the guardrail's returned reasoning only when it lines up 1:1 with what
+        was sent, so a collapsed or padded list can never be written to the wrong field.
+
+        ``None`` means "leave the reasoning alone": either the guardrail did not touch it
+        or it broke the contract, which is warned about rather than applied blindly.
+        """
+        if returned is None:
+            return None
+        if isinstance(returned, list) and len(returned) == sent_count and all(isinstance(t, str) for t in returned):
+            return tuple(returned)
+        verbose_proxy_logger.warning(
+            "OpenAI Chat Completions: guardrail returned %s reasoning texts for %s sent; leaving reasoning unchanged.",
+            len(returned) if isinstance(returned, list) else type(returned).__name__,
+            sent_count,
+        )
+        return None
+
+    @staticmethod
+    def _streaming_guardrail_inputs(
+        *,
+        texts: list[str],  # mutable-ok: guardrails rewrite the payload in place
+        images: list[str],  # mutable-ok: guardrails rewrite the payload in place
+        reasoning_texts: list[str],  # mutable-ok: guardrails rewrite the payload in place
+        responses_so_far: Sequence["ModelResponseStream"],
+    ) -> GenericGuardrailAPIInputs:
+        """Assemble the guardrail payload for a streaming round, omitting empty channels."""
+        inputs: Final = GenericGuardrailAPIInputs(texts=texts)
+        if images:
+            inputs["images"] = images
+        if reasoning_texts:
+            inputs["reasoning_texts"] = reasoning_texts
+        if responses_so_far and getattr(responses_so_far[0], "model", None):
+            inputs["model"] = responses_so_far[0].model
+        return inputs
+
+    @staticmethod
+    def _stream_has_ended(responses_so_far: Sequence["ModelResponseStream"]) -> bool:
+        """True once any chunk has delivered a ``finish_reason``."""
+        return any(choice.finish_reason is not None for response in responses_so_far for choice in response.choices)
+
+    @classmethod
+    def _streaming_reasoning_texts(cls, responses_so_far: Sequence["ModelResponseStream"]) -> list[str]:
+        """Accumulated reasoning per choice, ordered by choice index."""
+        accumulated: Final = cls._accumulate_reasoning_by_choice_index(responses_so_far)
+        return [accumulated[idx] for idx in sorted(accumulated)]  # mutable-ok: guardrail payload
+
+    @classmethod
+    def _accumulate_reasoning_by_choice_index(
+        cls, responses_so_far: Sequence["ModelResponseStream"]
+    ) -> Mapping[int, str]:
+        """Accumulate ``delta.reasoning_content`` per choice, keyed by
+        ``StreamingChoices.index`` rather than enumerate position, which collapses to 0
+        when each chunk carries a single non-zero-indexed choice for ``n > 1``.
+
+        Only ``reasoning_content`` participates. Streamed ``thinking_blocks`` are
+        delimited by their trailing ``signature`` rather than by a stable index, so they
+        cannot be accumulated positionally; providers that stream them also stream the
+        same text on ``reasoning_content`` (see ``get_combined_thinking_content`` in
+        ``streaming_chunk_builder_utils``).
+        """
+        per_choice: Final = tuple(
+            ((getattr(choice, "index", 0) or 0), reasoning)
+            for response in responses_so_far
+            for choice in response.choices
+            if (reasoning := cls._reasoning_content(choice))
+        )
+        return MappingProxyType(
+            {
+                idx: "".join(text for choice_idx, text in per_choice if choice_idx == idx)
+                for idx in dict.fromkeys(choice_idx for choice_idx, _ in per_choice)
+            }
+        )
+
     def _has_text_content(self, response: Union["ModelResponse", "ModelResponseStream"]) -> bool:
         """
-        Check if response has any text content or tool calls to process.
+        Check if response has any text content, reasoning content or tool calls to process.
 
         Override this method to customize text content detection.
         """
@@ -758,6 +954,8 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     if choice.message.tool_calls and isinstance(choice.message.tool_calls, list):
                         if len(choice.message.tool_calls) > 0:
                             return True
+                    if self._has_reasoning_content(choice):
+                        return True
         elif isinstance(response, ModelResponseStream):
             for streaming_choice in response.choices:
                 if isinstance(streaming_choice, litellm.StreamingChoices):
@@ -768,6 +966,8 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     if streaming_choice.delta.tool_calls and isinstance(streaming_choice.delta.tool_calls, list):
                         if len(streaming_choice.delta.tool_calls) > 0:
                             return True
+                    if self._has_reasoning_content(streaming_choice):
+                        return True
         return False
 
     def _extract_output_text_images_and_tool_calls(
@@ -832,6 +1032,38 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     tool_calls_to_check.append(tool_call_dict)
                     tool_call_task_mappings.append((choice_idx, int(tool_call_idx)))
 
+    @classmethod
+    def _extract_output_reasoning(
+        cls,
+        choice: Choices | StreamingChoices,
+        choice_idx: int,
+    ) -> tuple[ScannedReasoning, ...]:
+        """
+        Extract the reasoning a choice carries, deduplicated by text.
+
+        Reasoning travels to the guardrail under its own ``reasoning_texts`` key
+        rather than appended to ``texts``: a guardrail is free to collapse ``texts``
+        into a single joined rewrite, and folding reasoning in there would land the
+        model's chain of thought in the user-visible message content.
+
+        Override this method to customize reasoning extraction logic.
+        """
+        reasoning_content: Final = cls._reasoning_content(choice)
+        candidates: Final[tuple[tuple[str, ReasoningTarget], ...]] = (
+            ((reasoning_content, ReasoningContentTarget(choice_idx)),) if reasoning_content else ()
+        ) + tuple(
+            (block_text, ThinkingBlockTarget(choice_idx, block_idx))
+            for block_idx, block in enumerate(cls._thinking_blocks(choice))
+            if (block_text := cls._thinking_block_text(block)) is not None
+        )
+        return tuple(
+            ScannedReasoning(
+                text=text,
+                targets=tuple(target for candidate_text, target in candidates if candidate_text == text),
+            )
+            for text in dict.fromkeys(text for text, _ in candidates)
+        )
+
     def _convert_tool_call_to_dict(self, tool_call: dict[str, Any] | Any) -> dict[str, Any] | None:
         """
         Convert a tool call object to dictionary format.
@@ -888,6 +1120,35 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                 # Replace specific text item in list content
                 content[content_idx_optional]["text"] = guardrail_response
 
+    async def _apply_guardrail_responses_to_output_reasoning(
+        self,
+        response: "ModelResponse",
+        responses: Sequence[str],
+        scanned: tuple[ScannedReasoning, ...],
+    ) -> None:
+        """
+        Apply guardrailed reasoning back to the response.
+
+        Rewriting a thinking block's text invalidates the ``signature`` the provider
+        issued for it, so a client replaying that block on a later turn may have it
+        rejected. That only happens when a guardrail actually modifies the text.
+
+        Override this method to customize how reasoning responses are applied.
+        """
+        for guardrail_response, entry in zip(responses, scanned):
+            for target in entry.targets:
+                match target:
+                    case ReasoningContentTarget(choice_idx=choice_idx):
+                        response.choices[choice_idx].message.reasoning_content = guardrail_response
+                    case ThinkingBlockTarget(choice_idx=choice_idx, block_idx=block_idx):
+                        blocks = self._thinking_blocks(response.choices[choice_idx])
+                        if block_idx < len(blocks):
+                            block = blocks[block_idx]
+                            if block["type"] == "thinking":
+                                block["thinking"] = guardrail_response
+                    case _:
+                        assert_never(target)
+
     async def _apply_guardrail_responses_to_output_tool_calls(
         self,
         response: "ModelResponse",
@@ -943,6 +1204,11 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         # Build a mapping of what guardrailed text to use for each (choice_idx, content_idx)
         guardrail_map: Final[dict[tuple[int, int | None], str]] = {}
         for task_idx, guardrail_response in enumerate(guardrailed_texts):
+            if task_idx >= len(task_mappings):
+                # A guardrail may return more texts than it was sent (a reasoning-only
+                # round sends none yet still gets a rewrite back). Extra entries have
+                # nowhere to go, so drop them rather than crash the stream.
+                break
             mapping = task_mappings[task_idx]
             choice_idx = cast(int, mapping[0])
             content_idx_optional = cast(int | None, mapping[1])

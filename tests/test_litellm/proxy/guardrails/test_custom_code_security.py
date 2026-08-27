@@ -228,3 +228,54 @@ def test_augmented_assignment_works():
 def test_missing_apply_guardrail_raises():
     with pytest.raises(CustomCodeCompilationError, match="apply_guardrail"):
         _compile("x = 1\n")
+
+
+@pytest.mark.asyncio
+async def test_custom_code_can_read_and_rewrite_reasoning_texts():
+    """Reasoning reaches sandboxed code on its own key and can be rewritten there,
+    without ever riding in `texts` where a rewrite would land in the visible answer."""
+    code = (
+        "def apply_guardrail(inputs, request_data, input_type):\n"
+        '    reasoning = inputs.get("reasoning_texts") or []\n'
+        "    return modify(\n"
+        '        texts=inputs["texts"],\n'
+        '        reasoning_texts=[regex_replace(t, r"\\d{3}-\\d{2}-\\d{4}", "[SSN]") for t in reasoning],\n'
+        "    )\n"
+    )
+    guardrail = _compile(code)
+    from litellm.types.utils import GenericGuardrailAPIInputs
+
+    result = await guardrail.apply_guardrail(
+        inputs=GenericGuardrailAPIInputs(
+            texts=["Here is your record."],
+            reasoning_texts=["the user gave SSN 111-22-3333"],
+        ),
+        request_data={},
+        input_type="response",
+    )
+
+    assert result["texts"] == ["Here is your record."]
+    assert result["reasoning_texts"] == ["the user gave SSN [SSN]"]
+
+
+@pytest.mark.asyncio
+async def test_custom_code_can_block_on_reasoning_alone():
+    code = (
+        "def apply_guardrail(inputs, request_data, input_type):\n"
+        '    for text in inputs.get("reasoning_texts") or []:\n'
+        '        if regex_match(text, r"\\d{3}-\\d{2}-\\d{4}"):\n'
+        '            return block("SSN in reasoning")\n'
+        "    return allow()\n"
+    )
+    guardrail = _compile(code)
+    from litellm.types.utils import GenericGuardrailAPIInputs
+
+    with pytest.raises(HTTPException) as exc_info:
+        await guardrail.apply_guardrail(
+            inputs=GenericGuardrailAPIInputs(texts=["all clear"], reasoning_texts=["ssn 123-45-6789"]),
+            request_data={},
+            input_type="response",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["error"] == "SSN in reasoning"

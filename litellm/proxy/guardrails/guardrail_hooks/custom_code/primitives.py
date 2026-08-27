@@ -55,6 +55,7 @@ def modify(
     texts: Sequence[str] | None = None,
     images: Sequence[object] | None = None,
     tool_calls: Sequence[object] | None = None,
+    reasoning_texts: Sequence[str] | None = None,
 ) -> dict[str, object]:
     """
     Modify the request/response content.
@@ -63,6 +64,8 @@ def modify(
         texts: Modified text content (if None, keeps original)
         images: Modified image content (if None, keeps original)
         tool_calls: Modified tool calls (if None, keeps original)
+        reasoning_texts: Modified reasoning content (if None, keeps original). Must stay
+            the same length as ``inputs["reasoning_texts"]`` or it is discarded.
 
     Returns:
         Dict indicating the content should be modified
@@ -74,6 +77,8 @@ def modify(
         result["images"] = images
     if tool_calls is not None:
         result["tool_calls"] = tool_calls
+    if reasoning_texts is not None:
+        result["reasoning_texts"] = list(reasoning_texts)
     return result
 
 

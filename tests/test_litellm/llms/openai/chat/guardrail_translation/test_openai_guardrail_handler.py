@@ -1559,3 +1559,409 @@ class TestScanOnlyToolResults:
         assert data["messages"][3]["content"] == "page says [BLOCKED] here"
         assert data["messages"][3]["tool_call_id"] == "call_1"
         assert data["messages"][4]["content"] == "and then?"
+
+
+def _redact(text: str) -> str:
+    return text.replace("111-22-3333", "[REDACTED]")
+
+
+class RecordingReasoningGuardrail(CustomGuardrail):
+    """Records what it was handed and redacts SSNs in both channels."""
+
+    def __init__(self, guardrail_name: str = "test"):
+        super().__init__(guardrail_name=guardrail_name)
+        self.seen_texts: list[str] = []
+        self.seen_reasoning: list[str] = []
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional[Any] = None,
+    ) -> GenericGuardrailAPIInputs:
+        texts = list(inputs.get("texts") or [])
+        reasoning = list(inputs.get("reasoning_texts") or [])
+        self.seen_texts.extend(texts)
+        self.seen_reasoning.extend(reasoning)
+        out = GenericGuardrailAPIInputs(texts=[_redact(t) for t in texts])
+        if reasoning:
+            out["reasoning_texts"] = [_redact(t) for t in reasoning]
+        return out
+
+
+class JoiningGuardrail(CustomGuardrail):
+    """Mirrors prompt_security / hiddenlayer / grayswan: collapses texts to one element."""
+
+    def __init__(self, guardrail_name: str = "test"):
+        super().__init__(guardrail_name=guardrail_name)
+        self.seen_texts: list[str] = []
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional[Any] = None,
+    ) -> GenericGuardrailAPIInputs:
+        texts = list(inputs.get("texts") or [])
+        self.seen_texts.extend(texts)
+        return GenericGuardrailAPIInputs(texts=[_redact("\n".join(texts))])
+
+
+def _reasoning_response(
+    content: Optional[str] = "Answer",
+    reasoning_content: Optional[str] = None,
+    thinking_blocks: Optional[list] = None,
+) -> ModelResponse:
+    return ModelResponse(
+        id="chatcmpl-reasoning",
+        created=1234567890,
+        model="claude-sonnet-4-5",
+        object="chat.completion",
+        choices=[
+            Choices(
+                index=0,
+                message=Message(
+                    role="assistant",
+                    content=content,
+                    reasoning_content=reasoning_content,
+                    thinking_blocks=thinking_blocks,
+                ),
+                finish_reason="stop",
+            )
+        ],
+    )
+
+
+class TestOpenAIChatCompletionsHandlerReasoningOutput:
+    """Reasoning must reach the guardrail and accept its rewrites, without ever
+    riding in `texts` where a collapsing guardrail could merge it into content."""
+
+    @pytest.mark.asyncio
+    async def test_reasoning_content_is_sent_under_its_own_key_and_redacted(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+        response = _reasoning_response(
+            content="Your record is on file",
+            reasoning_content="the user gave SSN 111-22-3333, so I should look it up",
+        )
+
+        result = await handler.process_output_response(response=response, guardrail_to_apply=guardrail)
+
+        assert guardrail.seen_texts == ["Your record is on file"]
+        assert guardrail.seen_reasoning == ["the user gave SSN 111-22-3333, so I should look it up"]
+        assert result.choices[0].message.reasoning_content == "the user gave SSN [REDACTED], so I should look it up"
+        assert result.choices[0].message.content == "Your record is on file"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_never_leaks_into_content_for_a_collapsing_guardrail(self):
+        """A guardrail that joins `texts` must never see reasoning in that list, or it
+        would concatenate the chain of thought into the user-visible answer."""
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = JoiningGuardrail()
+        response = _reasoning_response(
+            content="Here is your record.",
+            reasoning_content="user SSN is 111-22-3333, look it up",
+        )
+
+        result = await handler.process_output_response(response=response, guardrail_to_apply=guardrail)
+
+        assert guardrail.seen_texts == ["Here is your record."]
+        assert result.choices[0].message.content == "Here is your record."
+        assert result.choices[0].message.reasoning_content == "user SSN is 111-22-3333, look it up"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_response_is_not_skipped(self):
+        """A response carrying reasoning but no content used to short-circuit the gate."""
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+        response = _reasoning_response(content=None, reasoning_content="SSN 111-22-3333 noted")
+
+        result = await handler.process_output_response(response=response, guardrail_to_apply=guardrail)
+
+        assert guardrail.seen_reasoning == ["SSN 111-22-3333 noted"]
+        assert result.choices[0].message.reasoning_content == "SSN [REDACTED] noted"
+
+    @pytest.mark.asyncio
+    async def test_thinking_blocks_are_scanned_and_redacted_block_is_left_alone(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+        response = _reasoning_response(
+            content="Done",
+            thinking_blocks=[
+                {"type": "thinking", "thinking": "first thought about 111-22-3333", "signature": "sig-a"},
+                {"type": "redacted_thinking", "data": "encrypted-blob"},
+                {"type": "thinking", "thinking": "second thought", "signature": "sig-b"},
+            ],
+        )
+
+        result = await handler.process_output_response(response=response, guardrail_to_apply=guardrail)
+
+        assert guardrail.seen_reasoning == ["first thought about 111-22-3333", "second thought"]
+        assert "encrypted-blob" not in guardrail.seen_reasoning
+        blocks = result.choices[0].message.thinking_blocks
+        assert blocks[0]["thinking"] == "first thought about [REDACTED]"
+        assert blocks[0]["signature"] == "sig-a"
+        assert blocks[1] == {"type": "redacted_thinking", "data": "encrypted-blob"}
+        assert blocks[2]["thinking"] == "second thought"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_reasoning_is_sent_once_and_written_to_both_fields(self):
+        """Providers set reasoning_content to the same string as the sole thinking block;
+        sending it twice doubles guardrail cost and lets the two copies diverge."""
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+        shared = "thinking about 111-22-3333"
+        response = _reasoning_response(
+            content="Done",
+            reasoning_content=shared,
+            thinking_blocks=[{"type": "thinking", "thinking": shared, "signature": "sig"}],
+        )
+
+        result = await handler.process_output_response(response=response, guardrail_to_apply=guardrail)
+
+        assert guardrail.seen_reasoning == [shared]
+        assert result.choices[0].message.reasoning_content == "thinking about [REDACTED]"
+        assert result.choices[0].message.thinking_blocks[0]["thinking"] == "thinking about [REDACTED]"
+
+    @pytest.mark.asyncio
+    async def test_misaligned_returned_reasoning_is_rejected_not_applied(self):
+        class CollapsingReasoningGuardrail(CustomGuardrail):
+            async def apply_guardrail(
+                self,
+                inputs: GenericGuardrailAPIInputs,
+                request_data: dict,
+                input_type: Literal["request", "response"],
+                logging_obj: Optional[Any] = None,
+            ) -> GenericGuardrailAPIInputs:
+                return GenericGuardrailAPIInputs(
+                    texts=list(inputs.get("texts") or []), reasoning_texts=["ONE"]
+                )
+
+        handler = OpenAIChatCompletionsHandler()
+        response = _reasoning_response(
+            content="Done",
+            reasoning_content="first reasoning",
+            thinking_blocks=[{"type": "thinking", "thinking": "different block", "signature": "sig"}],
+        )
+
+        result = await handler.process_output_response(
+            response=response, guardrail_to_apply=CollapsingReasoningGuardrail(guardrail_name="test")
+        )
+
+        assert result.choices[0].message.reasoning_content == "first reasoning"
+        assert result.choices[0].message.thinking_blocks[0]["thinking"] == "different block"
+
+    @pytest.mark.asyncio
+    async def test_multi_choice_reasoning_maps_back_to_its_own_choice(self):
+        class UppercaseReasoningGuardrail(CustomGuardrail):
+            async def apply_guardrail(
+                self,
+                inputs: GenericGuardrailAPIInputs,
+                request_data: dict,
+                input_type: Literal["request", "response"],
+                logging_obj: Optional[Any] = None,
+            ) -> GenericGuardrailAPIInputs:
+                return GenericGuardrailAPIInputs(
+                    texts=list(inputs.get("texts") or []),
+                    reasoning_texts=[t.upper() for t in (inputs.get("reasoning_texts") or [])],
+                )
+
+        handler = OpenAIChatCompletionsHandler()
+        response = ModelResponse(
+            id="chatcmpl-multi",
+            created=1234567890,
+            model="claude-sonnet-4-5",
+            object="chat.completion",
+            choices=[
+                Choices(
+                    index=i,
+                    message=Message(role="assistant", content=f"answer{i}", reasoning_content=f"reasoning{i}"),
+                    finish_reason="stop",
+                )
+                for i in (0, 1)
+            ],
+        )
+
+        result = await handler.process_output_response(
+            response=response, guardrail_to_apply=UppercaseReasoningGuardrail(guardrail_name="test")
+        )
+
+        assert result.choices[0].message.reasoning_content == "REASONING0"
+        assert result.choices[1].message.reasoning_content == "REASONING1"
+
+
+class TestOpenAIChatCompletionsHandlerReasoningStreaming:
+    @staticmethod
+    def _chunk(index: int, reasoning: Optional[str] = None, content: Optional[str] = None, finish=None):
+        from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+
+        return ModelResponseStream(
+            id="chatcmpl-reasoning",
+            created=1234567890,
+            model="claude-sonnet-4-5",
+            object="chat.completion.chunk",
+            choices=[
+                StreamingChoices(
+                    index=index,
+                    delta=Delta(content=content, reasoning_content=reasoning),
+                    finish_reason=finish,
+                )
+            ],
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_reasoning_rides_along_with_content(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+
+        chunks = [
+            self._chunk(0, reasoning="the SSN is ", content="Hello "),
+            self._chunk(0, reasoning="111-22-3333", content="there"),
+        ]
+
+        await handler.process_output_streaming_response(
+            responses_so_far=chunks,
+            guardrail_to_apply=guardrail,
+            litellm_logging_obj=None,
+        )
+
+        assert guardrail.seen_texts == ["Hello there"]
+        assert guardrail.seen_reasoning == ["the SSN is 111-22-3333"]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_round_does_not_trigger_a_guardrail_call(self):
+        """A reasoning model thinks for many chunks before its first content token.
+        Scanning each of those rounds would bill a round trip per chunk and hand an
+        output-side assertion the empty string to evaluate."""
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+
+        await handler.process_output_streaming_response(
+            responses_so_far=[self._chunk(0, reasoning="still thinking")],
+            guardrail_to_apply=guardrail,
+            litellm_logging_obj=None,
+        )
+
+        assert guardrail.seen_texts == []
+        assert guardrail.seen_reasoning == []
+
+    @pytest.mark.asyncio
+    async def test_streaming_reasoning_is_kept_per_choice_for_n_greater_than_one(self):
+        """Chunks carry one choice each with a non-zero index; keying by enumerate
+        position would merge both choices' reasoning into a single scanned text."""
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+
+        chunks = [
+            self._chunk(0, reasoning="ALPHA-secret", content="a0"),
+            self._chunk(1, reasoning="BETA-secret", content="b0"),
+            self._chunk(0, reasoning="-tail0", content="a1"),
+        ]
+
+        await handler.process_output_streaming_response(
+            responses_so_far=chunks,
+            guardrail_to_apply=guardrail,
+            litellm_logging_obj=None,
+        )
+
+        assert guardrail.seen_reasoning == ["ALPHA-secret-tail0", "BETA-secret"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_write_back_survives_a_guardrail_returning_extra_texts(self):
+        """A guardrail may return a rewritten `texts` list longer than what it was sent;
+        the extra entries have no target and must not crash the stream."""
+
+        class ExtraTextGuardrail(CustomGuardrail):
+            async def apply_guardrail(
+                self,
+                inputs: GenericGuardrailAPIInputs,
+                request_data: dict,
+                input_type: Literal["request", "response"],
+                logging_obj: Optional[Any] = None,
+            ) -> GenericGuardrailAPIInputs:
+                return GenericGuardrailAPIInputs(texts=["rewritten", "orphan", "orphan2"])
+
+        handler = OpenAIChatCompletionsHandler()
+        chunks = [self._chunk(0, reasoning="thinking", content="hi")]
+
+        result = await handler.process_output_streaming_response(
+            responses_so_far=chunks,
+            guardrail_to_apply=ExtraTextGuardrail(guardrail_name="test"),
+            litellm_logging_obj=None,
+        )
+
+        assert result[0].choices[0].delta.content == "rewritten"
+
+    @pytest.mark.asyncio
+    async def test_transform_sink_carries_guardrailed_reasoning(self):
+        from litellm.llms.base_llm.guardrail_translation.base_translation import (
+            StreamTransformSink,
+        )
+
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+        sink = StreamTransformSink()
+
+        chunks = [
+            self._chunk(0, reasoning="SSN 111-22-3333 ", content="Hello "),
+            self._chunk(0, reasoning="noted", content="world"),
+        ]
+
+        await handler.process_output_streaming_response(
+            responses_so_far=chunks,
+            guardrail_to_apply=guardrail,
+            litellm_logging_obj=None,
+            stream_transform_sink=sink,
+        )
+
+        assert guardrail.seen_texts == ["Hello world"]
+        assert guardrail.seen_reasoning == ["SSN 111-22-3333 noted"]
+        assert sink.mutated_text_per_choice == {0: "Hello world"}
+        assert sink.mutated_reasoning_per_choice == {0: "SSN [REDACTED] noted"}
+
+    @pytest.mark.asyncio
+    async def test_transform_sink_skips_a_mid_stream_reasoning_only_prefix(self):
+        from litellm.llms.base_llm.guardrail_translation.base_translation import (
+            StreamTransformSink,
+        )
+
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+        sink = StreamTransformSink()
+
+        await handler.process_output_streaming_response(
+            responses_so_far=[self._chunk(0, reasoning="SSN 111-22-3333")],
+            guardrail_to_apply=guardrail,
+            litellm_logging_obj=None,
+            stream_transform_sink=sink,
+        )
+
+        assert guardrail.seen_reasoning == []
+        assert sink.mutated_reasoning_per_choice == {}
+
+    @pytest.mark.asyncio
+    async def test_transform_sink_scans_a_reasoning_only_response_at_end_of_stream(self):
+        """A response that is nothing but reasoning must still be scanned once, rather
+        than falling through unscanned because it never produced a content token."""
+        from litellm.llms.base_llm.guardrail_translation.base_translation import (
+            StreamTransformSink,
+        )
+
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = RecordingReasoningGuardrail()
+        sink = StreamTransformSink()
+
+        await handler.process_output_streaming_response(
+            responses_so_far=[
+                self._chunk(0, reasoning="SSN 111-22-3333"),
+                self._chunk(0, reasoning=" done", finish="stop"),
+            ],
+            guardrail_to_apply=guardrail,
+            litellm_logging_obj=None,
+            stream_transform_sink=sink,
+        )
+
+        assert guardrail.seen_reasoning == ["SSN 111-22-3333 done"]
+        assert sink.mutated_reasoning_per_choice == {0: "SSN [REDACTED] done"}

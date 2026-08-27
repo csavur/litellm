@@ -209,7 +209,7 @@ class CustomCodeGuardrail(CustomGuardrail):
         http_post primitives to avoid blocking the event loop.
 
         Args:
-            inputs: Dictionary containing texts, images, tool_calls
+            inputs: Dictionary containing texts, images, tool_calls, reasoning_texts
             request_data: The original request data with metadata
             input_type: "request" for pre-call, "response" for post-call
             logging_obj: Optional logging object
@@ -362,6 +362,9 @@ class CustomCodeGuardrail(CustomGuardrail):
 
             if "tool_calls" in result and result["tool_calls"] is not None:
                 modified_inputs["tool_calls"] = result["tool_calls"]
+
+            if "reasoning_texts" in result and result["reasoning_texts"] is not None:
+                modified_inputs["reasoning_texts"] = result["reasoning_texts"]
 
             return cast(GenericGuardrailAPIInputs, modified_inputs)
 

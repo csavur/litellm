@@ -821,6 +821,7 @@ class _StreamingTextGuardrail(CustomGuardrail):
         self.response_calls = 0
         self.received_texts = []
         self.received_tool_calls = []
+        self.received_reasoning = []
 
     def should_run_guardrail(self, data, event_type):  # type: ignore[override]
         return True
@@ -840,17 +841,21 @@ class _StreamingTextGuardrail(CustomGuardrail):
         else:
             transformed = [t.upper() for t in texts]
         result = {"texts": transformed}
+        reasoning = inputs.get("reasoning_texts")
+        if reasoning:
+            self.received_reasoning.append(list(reasoning))
+            result["reasoning_texts"] = [t.upper() for t in reasoning]
         if idx < len(self._holdback_schedule):
             result["stream_holdback_chars"] = [self._holdback_schedule[idx]] * len(texts)
         return result
 
 
-def _stream_chunk(content, finish_reason=None, index=0):
+def _stream_chunk(content, finish_reason=None, index=0, reasoning=None):
     return ModelResponseStream(
         choices=[
             StreamingChoices(
                 index=index,
-                delta=Delta(content=content, role="assistant"),
+                delta=Delta(content=content, role="assistant", reasoning_content=reasoning),
                 finish_reason=finish_reason,
             )
         ],
@@ -1050,6 +1055,8 @@ class TestStreamingTransform:
             mutated_text_per_choice={0: "A", 1: "B"},
             emitted_text_per_choice={},
             holdback_per_choice={},
+            mutated_reasoning_per_choice={},
+            emitted_reasoning_per_choice={},
             finish_reason_per_choice={0: "stop", 1: "length"},
             is_final=True,
         )
@@ -1088,12 +1095,88 @@ class TestStreamingTransform:
             mutated_text_per_choice={0: "HI"},
             emitted_text_per_choice={},
             holdback_per_choice={},
+            mutated_reasoning_per_choice={},
+            emitted_reasoning_per_choice={},
             finish_reason_per_choice={},
             is_final=False,
         )
 
         assert synthetic.choices[0].delta.tool_calls is None
         assert synthetic.choices[0].delta.content == "HI"
+
+    def test_reasoning_is_withheld_until_the_final_flush(self):
+        """Reasoning has no holdback channel, so emitting it incrementally would put an
+        un-guardrailed prefix on the wire that a later redaction could not retract."""
+        reference_chunk = ModelResponseStream(choices=[StreamingChoices(index=0, delta=Delta(content=""))])
+        emitted_text: dict = {}
+        emitted_reasoning: dict = {}
+
+        def build(mutated_text, mutated_reasoning, is_final):
+            return UnifiedLLMGuardrails()._build_transform_chunk(
+                reference_chunk=reference_chunk,
+                mutated_text_per_choice=mutated_text,
+                emitted_text_per_choice=emitted_text,
+                holdback_per_choice={},
+                mutated_reasoning_per_choice=mutated_reasoning,
+                emitted_reasoning_per_choice=emitted_reasoning,
+                finish_reason_per_choice={0: "stop"},
+                is_final=is_final,
+            )
+
+        mid = build({}, {0: "raw thinking about 123-45-6789"}, False)
+        assert mid is None
+        assert emitted_reasoning == {}
+
+        final = build({0: "answer"}, {0: "thinking about [REDACTED]"}, True)
+        assert final.choices[0].delta.reasoning_content == "thinking about [REDACTED]"
+        assert final.choices[0].delta.content == "answer"
+        assert final.choices[0].delta.role == "assistant"
+        assert final.choices[0].finish_reason == "stop"
+        assert emitted_reasoning == {0: "thinking about [REDACTED]"}
+
+    def test_reasoning_rewrite_of_already_emitted_prefix_raises(self):
+        """Defence in depth: even though reasoning is only flushed once, rewriting bytes
+        already on the wire must fail closed exactly like content does."""
+        reference_chunk = ModelResponseStream(choices=[StreamingChoices(index=0, delta=Delta(content=""))])
+
+        with pytest.raises(unified_module.HTTPException) as exc_info:
+            UnifiedLLMGuardrails()._build_transform_chunk(
+                reference_chunk=reference_chunk,
+                mutated_text_per_choice={},
+                emitted_text_per_choice={},
+                holdback_per_choice={},
+                mutated_reasoning_per_choice={0: "the SSN is [REDACTED]"},
+                emitted_reasoning_per_choice={0: "the SSN is 123"},
+                finish_reason_per_choice={},
+                is_final=True,
+            )
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["error"] == "stream_transform_underflow"
+        assert "reasoning_content" in exc_info.value.detail["message"]
+
+    def test_deferred_finish_reason_survives_a_sibling_choice_emitting_reasoning(self):
+        """n>1: a choice present only to deliver a deferred finish_reason must still be
+        emitted, and must not be stamped with a role as if it started a message."""
+        reference_chunk = ModelResponseStream(choices=[StreamingChoices(index=0, delta=Delta(content=""))])
+
+        synthetic = UnifiedLLMGuardrails()._build_transform_chunk(
+            reference_chunk=reference_chunk,
+            mutated_text_per_choice={},
+            emitted_text_per_choice={},
+            holdback_per_choice={},
+            mutated_reasoning_per_choice={0: "deep thought"},
+            emitted_reasoning_per_choice={},
+            finish_reason_per_choice={0: "stop", 1: "content_filter"},
+            is_final=True,
+        )
+
+        by_index = {c.index: c for c in synthetic.choices}
+        assert by_index[0].delta.reasoning_content == "deep thought"
+        assert by_index[0].finish_reason == "stop"
+        assert by_index[1].finish_reason == "content_filter"
+        assert by_index[1].delta.content == ""
+        assert by_index[1].delta.role is None
 
     def test_rewriting_already_emitted_prefix_raises(self):
         """If a later transform rewrites bytes already streamed (not a forward
@@ -1110,6 +1193,8 @@ class TestStreamingTransform:
                 mutated_text_per_choice={0: "My SSN is [REDACTED]"},
                 emitted_text_per_choice={0: "My SSN is 123"},
                 holdback_per_choice={},
+                mutated_reasoning_per_choice={},
+                emitted_reasoning_per_choice={},
                 finish_reason_per_choice={},
                 is_final=False,
             )
@@ -1243,6 +1328,46 @@ class TestStreamingTransform:
         assert _delta_text(out[0]) == "LET ME CHECK "
         assert out[1].choices[0].delta.tool_calls
         assert out[1].choices[0].finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_lands_before_a_tool_call_finish_reason(self):
+        """A reasoning model that thinks and then calls a tool is the common case. The
+        guardrailed reasoning must reach the client before the finish_reason, or a
+        spec-compliant SSE client stops reading and drops it."""
+        guardrail = _StreamingTextGuardrail(sampling_rate=3)
+
+        tool_chunk = ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(
+                        content=None,
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{}"},
+                            }
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+        )
+        chunks = [
+            _stream_chunk(None, reasoning="A "),
+            _stream_chunk(None, reasoning="B "),
+            tool_chunk,
+        ]
+
+        out = await _drive_stream(UnifiedLLMGuardrails(), guardrail, chunks)
+
+        assert guardrail.received_reasoning[-1] == ["A B "]
+        assert out[0].choices[0].delta.reasoning_content == "A B "
+        assert out[0].choices[0].finish_reason is None
+        assert out[-1].choices[0].delta.tool_calls
+        assert out[-1].choices[0].finish_reason == "tool_calls"
 
     @pytest.mark.asyncio
     async def test_tool_call_blocking_guardrail_is_enforced(self):

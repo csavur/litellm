@@ -4194,6 +4194,9 @@ class GenericGuardrailAPIInputs(TypedDict, total=False):
     images: list[str]  # extracted images from the LLM response - for image guardrails
     tools: list[ChatCompletionToolParam]  # tools sent to the LLM
     tool_calls: list[ChatCompletionToolCallChunk] | list[ChatCompletionMessageToolCall]  # tool calls sent from the LLM
+    # reasoning/thinking text from the LLM response - kept out of `texts` so a guardrail
+    # that collapses `texts` cannot merge chain-of-thought into user-visible content
+    reasoning_texts: list[str]  # mutable-ok: guardrails rewrite inputs in place  # writable-ok: the key is reassigned
     structured_messages: list[
         AllMessageValues
     ]  # structured messages sent to the LLM - indicates if text is from system or user

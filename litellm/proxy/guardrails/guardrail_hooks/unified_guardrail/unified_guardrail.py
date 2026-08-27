@@ -8,7 +8,8 @@ Unified Guardrail, leveraging LiteLLM's /applyGuardrail endpoint
 
 import copy
 import json
-from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Mapping, MutableMapping, Sequence
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from fastapi import HTTPException
@@ -65,6 +66,11 @@ def _as_endpoint_translation(translation: _EndpointTranslation) -> _EndpointTran
 def _chunk_choices(item: object) -> Sequence[object]:
     choices: Final[Sequence[object]] = getattr(item, "choices", None) or []
     return choices
+
+
+# Shared read-only stand-in for "this channel has nothing this round", so the empty
+# case does not allocate or invite mutation.
+_NOTHING: Final[Mapping[int, Any]] = MappingProxyType({})
 
 
 class _StreamTerminated(Exception):
@@ -418,6 +424,46 @@ class UnifiedLLMGuardrails(CustomLogger):
             return
         raise exc
 
+    @staticmethod
+    def _forward_deltas(
+        *,
+        mutated: Mapping[int, str],
+        emitted: Mapping[int, str],
+        holdbacks: Mapping[int, int],
+        field_name: str,
+    ) -> Mapping[int, str]:
+        """Per choice, the slice of ``mutated`` past what has already been emitted, minus
+        any trailing holdback.
+
+        Raises HTTPException(400, stream_transform_underflow) when the guardrail's
+        transform is not a forward extension of what has already been streamed
+        (shorter than, or rewrites, the already-sent prefix), since emitted bytes
+        cannot be retracted. This makes the framework fail closed rather than
+        silently leave un-transformed text on the wire; a guardrail that needs to
+        rewrite recent output must withhold it first via ``stream_holdback_chars``.
+        """
+
+        def _one(choice_idx: int, text: str) -> str:
+            already: Final = emitted.get(choice_idx, "")
+            if not text.startswith(already):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "stream_transform_underflow",
+                        "message": (
+                            f"Guardrail streaming transform of {field_name} for choice {choice_idx} is not a "
+                            f"forward extension of the {len(already)} chars already streamed to the client "
+                            "(it is shorter than, or rewrites, the emitted prefix); emitted bytes "
+                            "cannot be retracted. Withhold recent output via stream_holdback_chars "
+                            "before rewriting it."
+                        ),
+                    },
+                )
+            end: Final = max(len(already), len(text) - max(0, holdbacks.get(choice_idx, 0)))
+            return text[len(already) : end]
+
+        return {choice_idx: _one(choice_idx, text) for choice_idx, text in mutated.items()}
+
     def _build_transform_chunk(
         self,
         *,
@@ -425,8 +471,11 @@ class UnifiedLLMGuardrails(CustomLogger):
         mutated_text_per_choice: dict[int, str],
         emitted_text_per_choice: dict[int, str],
         holdback_per_choice: dict[int, int],
+        mutated_reasoning_per_choice: Mapping[int, str],
+        emitted_reasoning_per_choice: MutableMapping[int, str],  # mutable-ok: emitted-bytes accumulator
         finish_reason_per_choice: dict[int, str | None],
         is_final: bool,
+        flush_reasoning: bool = False,
     ) -> ModelResponseStream | None:
         """Build the synthetic chunk carrying the newly-guardrailed deltas.
 
@@ -437,59 +486,36 @@ class UnifiedLLMGuardrails(CustomLogger):
         text to emit (e.g. a tool-call-only turn) or nothing new and this is not
         the final chunk.
 
-        Raises HTTPException(400, stream_transform_underflow) when the guardrail's
-        transform is not a forward extension of what has already been streamed
-        (shorter than, or rewrites, the already-sent prefix), since emitted bytes
-        cannot be retracted. This makes the framework fail closed rather than
-        silently leave un-transformed text on the wire; a guardrail that needs to
-        rewrite recent output must withhold it first via ``stream_holdback_chars``.
+        Underflow (a transform that rewrites already-emitted bytes) fails closed in
+        ``_forward_deltas``.
         """
-        if not mutated_text_per_choice:
-            # Fix #4 — on the final flush a deferred finish_reason (from a mixed
-            # content+tool_calls chunk whose passthrough suppressed it) still
-            # needs to reach the client, even if the guardrail returned no text
-            # to emit. Build a terminator chunk carrying finish_reason per choice.
-            if is_final and finish_reason_per_choice:
-                terminator_choices: Final[list[StreamingChoices]] = []
-                for choice_idx, finish_reason in finish_reason_per_choice.items():
-                    if finish_reason is None:
-                        continue
-                    terminator_choices.append(
-                        StreamingChoices(
-                            index=choice_idx,
-                            delta=Delta(content="", role=None, tool_calls=None),
-                            finish_reason=finish_reason,
-                        )
-                    )
-                if terminator_choices:
-                    return ModelResponseStream(
-                        id=getattr(reference_chunk, "id", None),
-                        created=getattr(reference_chunk, "created", None),
-                        model=getattr(reference_chunk, "model", None),
-                        choices=terminator_choices,
-                    )
+        # Reasoning has no holdback channel of its own (``stream_holdback_chars`` is
+        # indexed against ``texts``), so emitting it on every sampled round would put an
+        # un-guardrailed prefix on the wire that a later round could not retract without
+        # tripping the underflow check. It is flushed once, at end of stream or just
+        # before a tool-call chunk carries a finish_reason past it.
+        emitting_reasoning: Final = mutated_reasoning_per_choice if (is_final or flush_reasoning) else _NOTHING
+
+        # Fix #4 — on the final flush a deferred finish_reason (from a mixed
+        # content+tool_calls chunk whose passthrough suppressed it) still needs to
+        # reach the client, even for a choice the guardrail returned no text for.
+        deferred_finishes: Final = finish_reason_per_choice if is_final else _NOTHING
+
+        if not mutated_text_per_choice and not emitting_reasoning and not deferred_finishes:
             return None
 
-        deltas: Final[dict[int, str]] = {}
-        for choice_idx, text in mutated_text_per_choice.items():
-            already = emitted_text_per_choice.get(choice_idx, "")
-            if not text.startswith(already):
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": "stream_transform_underflow",
-                        "message": (
-                            f"Guardrail streaming transform for choice {choice_idx} is not a forward "
-                            f"extension of the {len(already)} chars already streamed to the client "
-                            "(it is shorter than, or rewrites, the emitted prefix); emitted bytes "
-                            "cannot be retracted. Withhold recent output via stream_holdback_chars "
-                            "before rewriting it."
-                        ),
-                    },
-                )
-            holdback = 0 if is_final else max(0, holdback_per_choice.get(choice_idx, 0))
-            end = max(len(already), len(text) - holdback)
-            deltas[choice_idx] = text[len(already) : end]
+        deltas: Final = self._forward_deltas(
+            mutated=mutated_text_per_choice,
+            emitted=emitted_text_per_choice,
+            holdbacks=_NOTHING if is_final else holdback_per_choice,
+            field_name="content",
+        )
+        reasoning_deltas: Final = self._forward_deltas(
+            mutated=emitting_reasoning,
+            emitted=emitted_reasoning_per_choice,
+            holdbacks=_NOTHING,
+            field_name="reasoning_content",
+        )
 
         # Iterate the mutated choices (not just those in reference_chunk) so a
         # choice with pending text is never dropped for n > 1. finish_reason is
@@ -497,21 +523,29 @@ class UnifiedLLMGuardrails(CustomLogger):
         # earlier chunk than the stream's last one); tool_calls are dropped since
         # v1 does not transform streamed tool calls (they pass through raw).
         synthetic_choices: Final[list[StreamingChoices]] = []
-        for choice_idx in mutated_text_per_choice:
+        for choice_idx in dict.fromkeys((*mutated_text_per_choice, *emitting_reasoning, *deferred_finishes)):
             delta_text = deltas.get(choice_idx, "")
-            finish_reason = finish_reason_per_choice.get(choice_idx) if is_final else None
-            # Skip a choice with nothing to say: no new content and no
+            delta_reasoning = reasoning_deltas.get(choice_idx, "")
+            finish_reason = deferred_finishes.get(choice_idx)
+            # Skip a choice with nothing to say: no new content, no new reasoning and no
             # finish_reason to deliver. This avoids emitting an empty delta for an
             # already-finished choice (e.g. one that terminated via a passed-through
             # tool-call chunk, which already carried its own finish_reason).
-            if not delta_text and finish_reason is None:
+            if not delta_text and not delta_reasoning and finish_reason is None:
                 continue
-            # role="assistant" on this choice's first emitted delta only.
-            role = "assistant" if not emitted_text_per_choice.get(choice_idx) else None
+            # role="assistant" on this choice's first emitted delta only; a choice
+            # present solely to deliver a deferred finish_reason starts no message.
+            already_started = emitted_text_per_choice.get(choice_idx) or emitted_reasoning_per_choice.get(choice_idx)
+            starts_message = (delta_text or delta_reasoning) and not already_started
             synthetic_choices.append(
                 StreamingChoices(
                     index=choice_idx,
-                    delta=Delta(content=delta_text, role=role, tool_calls=None),
+                    delta=Delta(
+                        content=delta_text,
+                        role="assistant" if starts_message else None,
+                        tool_calls=None,
+                        reasoning_content=delta_reasoning or None,
+                    ),
                     finish_reason=finish_reason,
                 )
             )
@@ -523,6 +557,10 @@ class UnifiedLLMGuardrails(CustomLogger):
             emitted_text_per_choice[choice_idx] = emitted_text_per_choice.get(choice_idx, "") + deltas.get(
                 choice_idx, ""
             )
+        for choice_idx in emitting_reasoning:
+            emitted_reasoning_per_choice[choice_idx] = emitted_reasoning_per_choice.get(
+                choice_idx, ""
+            ) + reasoning_deltas.get(choice_idx, "")
 
         return ModelResponseStream(
             id=getattr(reference_chunk, "id", None),
@@ -543,8 +581,10 @@ class UnifiedLLMGuardrails(CustomLogger):
         responses_so_far: Sequence[object],
         responses_yielded: list[object],
         emitted_text_per_choice: dict[int, str],
+        emitted_reasoning_per_choice: MutableMapping[int, str],  # mutable-ok: emitted-bytes accumulator
         finish_reason_per_choice: dict[int, str | None],
         is_final: bool,
+        flush_reasoning: bool = False,
     ) -> AsyncGenerator[object, None]:
         """Run one guardrail processing round and emit the resulting diff chunk.
 
@@ -570,9 +610,12 @@ class UnifiedLLMGuardrails(CustomLogger):
                 reference_chunk=reference_chunk,
                 mutated_text_per_choice=sink.mutated_text_per_choice,
                 emitted_text_per_choice=emitted_text_per_choice,
+                emitted_reasoning_per_choice=emitted_reasoning_per_choice,
+                mutated_reasoning_per_choice=sink.mutated_reasoning_per_choice,
                 holdback_per_choice=sink.holdback_per_choice,
                 finish_reason_per_choice=finish_reason_per_choice,
                 is_final=is_final,
+                flush_reasoning=flush_reasoning,
             )
         except ModifyResponseException as e:
             if e.original_response is None:
@@ -618,11 +661,14 @@ class UnifiedLLMGuardrails(CustomLogger):
         responses_so_far: Final[list[object]] = []
         responses_yielded: Final[list[object]] = []
         emitted_text_per_choice: Final[dict[int, str]] = {}
+        emitted_reasoning_per_choice: Final[MutableMapping[int, str]] = {}  # mutable-ok: emitted-bytes accum
         finish_reason_per_choice: Final[dict[int, str | None]] = {}
         chunk_counter = 0
         last_chunk: object | None = None
 
-        def _round(reference_chunk: object, is_final: bool) -> AsyncGenerator[object, None]:
+        def _round(
+            reference_chunk: object, is_final: bool, flush_reasoning: bool = False
+        ) -> AsyncGenerator[object, None]:
             return self._emit_transform_round(
                 endpoint_translation=endpoint_translation,
                 guardrail_to_apply=guardrail_to_apply,
@@ -633,8 +679,10 @@ class UnifiedLLMGuardrails(CustomLogger):
                 responses_so_far=responses_so_far,
                 responses_yielded=responses_yielded,
                 emitted_text_per_choice=emitted_text_per_choice,
+                emitted_reasoning_per_choice=emitted_reasoning_per_choice,
                 finish_reason_per_choice=finish_reason_per_choice,
                 is_final=is_final,
+                flush_reasoning=flush_reasoning,
             )
 
         saw_tool_calls = False
@@ -663,7 +711,7 @@ class UnifiedLLMGuardrails(CustomLogger):
                     # SSE-compliant client stops reading at that finish_reason
                     # and drops the end-of-stream text flush that would follow.
                     if saw_text_content:
-                        async for out in _round(item, is_final=False):
+                        async for out in _round(item, is_final=False, flush_reasoning=True):
                             yield out
                     # Fix #1 — pass finish_reason_per_choice into the
                     # passthrough so a mixed content+tool_call chunk defers its
@@ -776,17 +824,26 @@ class UnifiedLLMGuardrails(CustomLogger):
         return False
 
     @staticmethod
-    def _chunk_carries_text(item: object) -> bool:
-        """True if any choice in this chunk has non-empty string ``delta.content``."""
-        for choice in _chunk_choices(item):
-            delta = getattr(choice, "delta", None)
-            content = getattr(delta, "content", None)
-            if isinstance(content, str) and content != "":
+    def _delta_carries_text(delta: object) -> bool:
+        """True if this delta has non-empty string ``content`` or ``reasoning_content``.
+
+        Reasoning counts: both travel on the transform and both must land before a
+        ``finish_reason`` that would make a spec-compliant client stop reading.
+        """
+        for field_name in ("content", "reasoning_content"):
+            value = getattr(delta, field_name, None)
+            if isinstance(value, str) and value != "":
                 return True
         return False
 
-    @staticmethod
+    @classmethod
+    def _chunk_carries_text(cls, item: object) -> bool:
+        """True if any choice in this chunk carries text or reasoning to transform."""
+        return any(cls._delta_carries_text(getattr(choice, "delta", None)) for choice in _chunk_choices(item))
+
+    @classmethod
     def _tool_call_passthrough_chunk(
+        cls,
         item: object,
         finish_reason_per_choice: "dict[int, str | None] | None" = None,
     ) -> ModelResponseStream:
@@ -810,7 +867,7 @@ class UnifiedLLMGuardrails(CustomLogger):
             delta = getattr(choice, "delta", None)
             idx = getattr(choice, "index", 0) or 0
             original_finish = getattr(choice, "finish_reason", None)
-            has_text = isinstance(getattr(delta, "content", None), str) and getattr(delta, "content", "") != ""
+            has_text = cls._delta_carries_text(delta)
             if has_text and original_finish is not None and finish_reason_per_choice is not None:
                 finish_reason_per_choice[idx] = original_finish
                 passthrough_finish: str | None = None

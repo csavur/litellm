@@ -14,7 +14,10 @@ Pattern Overview:
 This pattern can be replicated for other message formats (e.g., Anthropic).
 """
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Union, cast
+
+from typing_extensions import assert_never
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -33,13 +36,20 @@ from litellm.llms.base_llm.guardrail_translation.utils import (
     scoped_structured_message_indices,
 )
 from litellm.main import stream_chunk_builder
-from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
+from litellm.types.llms.openai import (
+    AllMessageValues,
+    ChatCompletionRedactedThinkingBlock,
+    ChatCompletionThinkingBlock,
+    ChatCompletionToolParam,
+)
 from litellm.types.proxy.guardrails.guardrail_hooks.generic_guardrail_api import (
     coerce_stream_holdback_value,
 )
 from litellm.types.utils import (
     Choices,
+    Delta,
     GenericGuardrailAPIInputs,
+    Message,
     ModelResponse,
     ModelResponseStream,
     StreamingChoices,
@@ -47,6 +57,61 @@ from litellm.types.utils import (
 
 if TYPE_CHECKING:
     from litellm.integrations.custom_guardrail import CustomGuardrail
+
+
+@dataclass(frozen=True, slots=True)
+class ChoiceContentTarget:
+    choice_idx: int
+    content_idx: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningContentTarget:
+    choice_idx: int
+
+
+@dataclass(frozen=True, slots=True)
+class ThinkingBlockTarget:
+    choice_idx: int
+    block_idx: int
+
+
+OutputWriteBackTarget = ChoiceContentTarget | ReasoningContentTarget | ThinkingBlockTarget
+
+
+def reasoning_fragments(source: Delta | Message) -> tuple[tuple[str, int | None], ...]:
+    """The model's chain of thought as ``(text, thinking block index)`` pairs.
+
+    The index is ``None`` for the flat ``reasoning_content`` string. Both fields are
+    deleted rather than set to ``None`` when a provider returns no reasoning, so both
+    are read defensively. Redacted thinking blocks carry encrypted ``data`` instead of
+    text and are skipped.
+    """
+    reasoning_content: Final = getattr(source, "reasoning_content", None)
+    thinking_blocks: Final[list[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock]] = (
+        getattr(source, "thinking_blocks", None) or []
+    )
+    return (
+        *(((reasoning_content, None),) if isinstance(reasoning_content, str) and reasoning_content else ()),
+        *(
+            (thinking, block_idx)
+            for block_idx, block in enumerate(thinking_blocks)
+            if (thinking := thinking_block_text(block)) is not None
+        ),
+    )
+
+
+def thinking_block_text(
+    block: ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock,
+) -> str | None:
+    """The scannable text of a thinking block, or None for a redacted one."""
+    if block["type"] != "thinking" or "thinking" not in block:
+        return None
+    return block["thinking"] or None
+
+
+def reasoning_target(choice_idx: int, block_idx: int | None) -> OutputWriteBackTarget:
+    return ReasoningContentTarget(choice_idx) if block_idx is None else ThinkingBlockTarget(choice_idx, block_idx)
 
 
 class OpenAIChatCompletionsHandler(BaseTranslation):
@@ -353,13 +418,12 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         texts_to_check: Final[list[str]] = []
         images_to_check: Final[list[str]] = []
         tool_calls_to_check: Final[list[dict[str, Any]]] = []
-        text_task_mappings: Final[list[tuple[int, int | None]]] = []
+        text_task_mappings: Final[list[OutputWriteBackTarget]] = []
         tool_call_task_mappings: Final[list[tuple[int, int]]] = []
-        # text_task_mappings: Track (choice_index, content_index) for each text
-        # content_index is None for string content, int for list content
+        # text_task_mappings: Track the write-back target for each scanned text
         # tool_call_task_mappings: Track (choice_index, tool_call_index) for each tool call
 
-        # Step 1: Extract all text content, images, and tool calls from response choices
+        # Step 1: Extract all reasoning, text content, images, and tool calls from response choices
         for choice_idx, choice in enumerate(response.choices):
             self._extract_output_text_images_and_tool_calls(
                 choice=choice,
@@ -537,12 +601,12 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         # Step 2: Create lists for guardrail processing
         texts_to_check: Final[list[str]] = []
         images_to_check: Final[list[str]] = []
-        task_mappings: Final[list[tuple[int, int | None]]] = []
-        # Track (choice_index, content_index) for each combined text
+        task_mappings: Final[list[OutputWriteBackTarget]] = []
+        # Track the write-back target for each combined text
 
-        for (map_choice_idx, map_content_idx), combined_text in combined_texts.items():
+        for target, combined_text in combined_texts.items():
             texts_to_check.append(combined_text)
-            task_mappings.append((map_choice_idx, map_content_idx))
+            task_mappings.append(target)
 
         # Step 3: Apply guardrail to all combined texts in batch
         if texts_to_check:
@@ -616,6 +680,28 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     accumulated[idx] = accumulated.get(idx, "") + content
         return accumulated
 
+    @staticmethod
+    def _accumulate_reasoning_by_choice_index(
+        responses_so_far: list["ModelResponseStream"],
+    ) -> dict[int, str]:
+        """Accumulate raw ``delta.reasoning_content`` per choice, keyed by
+        ``StreamingChoices.index``, mirroring
+        ``_accumulate_string_content_by_choice_index`` for the chain of thought."""
+        accumulated: Final[dict[int, str]] = {}
+        for response in responses_so_far:
+            for choice in response.choices:
+                if isinstance(choice, litellm.StreamingChoices):
+                    source = choice.delta
+                elif isinstance(choice, litellm.Choices):
+                    source = choice.message
+                else:
+                    continue
+                reasoning_content = getattr(source, "reasoning_content", None)
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    idx = getattr(choice, "index", 0) or 0
+                    accumulated[idx] = accumulated.get(idx, "") + reasoning_content
+        return accumulated
+
     async def _process_streaming_transform(
         self,
         *,
@@ -634,7 +720,8 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         always sees consistent input) and hands the result back out of band.
         """
         raw_by_index: Final = self._accumulate_string_content_by_choice_index(responses_so_far)
-        if not raw_by_index:
+        reasoning_by_index: Final = self._accumulate_reasoning_by_choice_index(responses_so_far)
+        if not raw_by_index and not reasoning_by_index:
             sink.mutated_text_per_choice = {}
             sink.holdback_per_choice = {}
             return
@@ -646,7 +733,14 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         # wrong choice indices when we rebuild the sink dicts by
         # ``enumerate(indices)``.
         indices: Final = sorted(raw_by_index.keys())
-        texts_to_check: Final = [raw_by_index[i] for i in indices]
+        # The chain of thought is appended after the content texts so the guardrail can
+        # block on it while the sink stays aligned with the content indices. Rewrites of
+        # reasoning are not propagated here: the incremental diff only emits content deltas.
+        reasoning_indices: Final = sorted(reasoning_by_index.keys())
+        texts_to_check: Final = [
+            *(raw_by_index[i] for i in indices),
+            *(reasoning_by_index[i] for i in reasoning_indices),
+        ]
 
         if request_data is None:
             request_data = {"responses": responses_so_far}
@@ -674,12 +768,12 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         # not emitted raw) so a malformed response fails closed instead of leaking.
         if returned_texts is None:
             returned_texts = texts_to_check
-        elif len(returned_texts) < len(texts_to_check):
+        elif len(returned_texts) < len(indices):
             verbose_proxy_logger.warning(
-                "OpenAI Chat Completions: guardrail returned %s transformed texts for %s inputs on the "
+                "OpenAI Chat Completions: guardrail returned %s transformed texts for %s content inputs on the "
                 "streaming transform path; withholding the unmatched choices to fail closed.",
                 len(returned_texts),
-                len(texts_to_check),
+                len(indices),
             )
 
         holdback: Final = guardrailed_inputs.get("stream_holdback_chars") or []
@@ -692,7 +786,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
 
     def _combine_streaming_texts(
         self, responses_so_far: list["ModelResponseStream"]
-    ) -> dict[tuple[int, int | None], str]:
+    ) -> dict[OutputWriteBackTarget, str]:
         """
         Combine all streaming chunks into complete text per choice.
 
@@ -702,25 +796,37 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             responses_so_far: List of LiteLLM ModelResponseStream objects
 
         Returns:
-            Dict mapping (choice_idx, content_idx) to combined text string
+            Dict mapping each write-back target to its combined text string
+
+        Reasoning is accumulated from ``reasoning_content`` only: per-chunk
+        ``thinking_blocks`` carry partial fragments whose indices are not stable
+        across chunks, and the assembled response scanned at end of stream covers
+        them.
         """
-        combined_texts: Final[dict[tuple[int, int | None], str]] = {}
+        combined_texts: Final[dict[OutputWriteBackTarget, str]] = {}
 
         for response_idx, response in enumerate(responses_so_far):
             for choice_idx, choice in enumerate(response.choices):
                 if isinstance(choice, litellm.StreamingChoices):
                     content = choice.delta.content
+                    source = choice.delta
                 elif isinstance(choice, litellm.Choices):
                     content = choice.message.content
+                    source = choice.message
                 else:
                     continue
+
+                reasoning_content = getattr(source, "reasoning_content", None)
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    reasoning_key: OutputWriteBackTarget = ReasoningContentTarget(choice_idx)
+                    combined_texts[reasoning_key] = combined_texts.get(reasoning_key, "") + reasoning_content
 
                 if content is None:
                     continue
 
                 if isinstance(content, str):
                     # String content - accumulate for this choice
-                    str_key: tuple[int, int | None] = (choice_idx, None)
+                    str_key: OutputWriteBackTarget = ChoiceContentTarget(choice_idx, None)
                     if str_key not in combined_texts:
                         combined_texts[str_key] = ""
                     combined_texts[str_key] += content
@@ -730,10 +836,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     for content_idx, content_item in enumerate(content):
                         text_str = content_item.get("text")
                         if text_str:
-                            list_key: tuple[int, int | None] = (
-                                choice_idx,
-                                content_idx,
-                            )
+                            list_key: OutputWriteBackTarget = ChoiceContentTarget(choice_idx, content_idx)
                             if list_key not in combined_texts:
                                 combined_texts[list_key] = ""
                             combined_texts[list_key] += text_str
@@ -742,7 +845,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
 
     def _has_text_content(self, response: Union["ModelResponse", "ModelResponseStream"]) -> bool:
         """
-        Check if response has any text content or tool calls to process.
+        Check if response has any reasoning, text content or tool calls to process.
 
         Override this method to customize text content detection.
         """
@@ -758,6 +861,9 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     if choice.message.tool_calls and isinstance(choice.message.tool_calls, list):
                         if len(choice.message.tool_calls) > 0:
                             return True
+                    # Check for chain of thought
+                    if reasoning_fragments(choice.message):
+                        return True
         elif isinstance(response, ModelResponseStream):
             for streaming_choice in response.choices:
                 if isinstance(streaming_choice, litellm.StreamingChoices):
@@ -768,6 +874,9 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     if streaming_choice.delta.tool_calls and isinstance(streaming_choice.delta.tool_calls, list):
                         if len(streaming_choice.delta.tool_calls) > 0:
                             return True
+                    # Check for chain of thought
+                    if reasoning_fragments(streaming_choice.delta):
+                        return True
         return False
 
     def _extract_output_text_images_and_tool_calls(
@@ -777,11 +886,11 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         texts_to_check: list[str],
         images_to_check: list[str],
         tool_calls_to_check: list[dict[str, Any]],
-        text_task_mappings: list[tuple[int, int | None]],
+        text_task_mappings: list[OutputWriteBackTarget],
         tool_call_task_mappings: list[tuple[int, int]],
     ) -> None:
         """
-        Extract text content, images, and tool calls from a response choice.
+        Extract reasoning, text content, images, and tool calls from a response choice.
 
         Override this method to customize text/image/tool call extraction logic.
         """
@@ -800,11 +909,18 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             # Unknown choice type, skip processing
             return
 
+        # Process the chain of thought if it exists
+        for reasoning_text, block_idx in reasoning_fragments(
+            choice.message if isinstance(choice, litellm.Choices) else choice.delta
+        ):
+            texts_to_check.append(reasoning_text)
+            text_task_mappings.append(reasoning_target(choice_idx, block_idx))
+
         # Process content if it exists
         if content and isinstance(content, str):
             # Simple string content
             texts_to_check.append(content)
-            text_task_mappings.append((choice_idx, None))
+            text_task_mappings.append(ChoiceContentTarget(choice_idx, None))
 
         elif content and isinstance(content, list):
             # List content (e.g., multimodal response)
@@ -813,7 +929,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                 content_text = content_item.get("text")
                 if content_text:
                     texts_to_check.append(content_text)
-                    text_task_mappings.append((choice_idx, int(content_idx)))
+                    text_task_mappings.append(ChoiceContentTarget(choice_idx, int(content_idx)))
 
                 # Extract images
                 if content_item.get("type") == "image_url":
@@ -861,32 +977,37 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         self,
         response: "ModelResponse",
         responses: list[str],
-        task_mappings: list[tuple[int, int | None]],
+        task_mappings: list[OutputWriteBackTarget],
     ) -> None:
         """
         Apply guardrail text responses back to output response.
 
         Override this method to customize how text responses are applied.
         """
-        for task_idx, guardrail_response in enumerate(responses):
-            mapping = task_mappings[task_idx]
-            choice_idx = cast(int, mapping[0])
-            content_idx_optional = cast(int | None, mapping[1])
+        for target, guardrail_response in zip(task_mappings, responses):
+            choice = cast(Choices, response.choices[target.choice_idx])
 
-            choice = cast(Choices, response.choices[choice_idx])
-
-            # Handle content
-            content = choice.message.content
-            if content is None:
-                continue
-
-            if isinstance(content, str) and content_idx_optional is None:
-                # Replace string content with guardrail response
-                choice.message.content = guardrail_response
-
-            elif isinstance(content, list) and content_idx_optional is not None:
-                # Replace specific text item in list content
-                content[content_idx_optional]["text"] = guardrail_response
+            match target:
+                case ChoiceContentTarget(content_idx=content_idx):
+                    content = choice.message.content
+                    if isinstance(content, str) and content_idx is None:
+                        # Replace string content with guardrail response
+                        choice.message.content = guardrail_response
+                    elif isinstance(content, list) and content_idx is not None:
+                        # Replace specific text item in list content
+                        content[content_idx]["text"] = guardrail_response
+                case ReasoningContentTarget():
+                    choice.message.reasoning_content = guardrail_response
+                case ThinkingBlockTarget(block_idx=block_idx):
+                    thinking_blocks: list[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock] = (
+                        getattr(choice.message, "thinking_blocks", None) or []
+                    )
+                    if block_idx < len(thinking_blocks):
+                        block = thinking_blocks[block_idx]
+                        if block["type"] == "thinking":
+                            block["thinking"] = guardrail_response
+                case _:
+                    assert_never(target)
 
     async def _apply_guardrail_responses_to_output_tool_calls(
         self,
@@ -925,7 +1046,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         self,
         responses: list["ModelResponseStream"],
         guardrailed_texts: list[str],
-        task_mappings: list[tuple[int, int | None]],
+        task_mappings: list[OutputWriteBackTarget],
     ) -> None:
         """
         Apply guardrail responses back to output streaming responses.
@@ -936,61 +1057,57 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         Args:
             responses: List of ModelResponseStream objects to modify
             guardrailed_texts: List of guardrailed text responses (combined from all chunks)
-            task_mappings: List of tuples (choice_idx, content_idx)
+            task_mappings: List of write-back targets, aligned with guardrailed_texts
 
         Override this method to customize how responses are applied to streaming responses.
         """
-        # Build a mapping of what guardrailed text to use for each (choice_idx, content_idx)
-        guardrail_map: Final[dict[tuple[int, int | None], str]] = {}
-        for task_idx, guardrail_response in enumerate(guardrailed_texts):
-            mapping = task_mappings[task_idx]
-            choice_idx = cast(int, mapping[0])
-            content_idx_optional = cast(int | None, mapping[1])
-            guardrail_map[(choice_idx, content_idx_optional)] = guardrail_response
+        guardrail_map: Final[dict[OutputWriteBackTarget, str]] = dict(zip(task_mappings, guardrailed_texts))
 
-        # Track which choices we've already set the guardrailed text for
-        # Key: (choice_idx, content_idx), Value: boolean (True if already set)
-        already_set: Final[dict[tuple[int, int | None], bool]] = {}
+        # Track which targets we've already set the guardrailed text for
+        already_set: Final[dict[OutputWriteBackTarget, bool]] = {}
 
         # Iterate through all responses and update content
         for response_idx, response in enumerate(responses):
             for choice_idx_in_response, choice in enumerate(response.choices):
                 if isinstance(choice, litellm.StreamingChoices):
                     content = choice.delta.content
+                    source = choice.delta
                 elif isinstance(choice, litellm.Choices):
                     content = choice.message.content
+                    source = choice.message
                 else:
                     continue
+
+                reasoning_key: OutputWriteBackTarget = ReasoningContentTarget(choice_idx_in_response)
+                if isinstance(getattr(source, "reasoning_content", None), str) and reasoning_key in guardrail_map:
+                    if reasoning_key not in already_set:
+                        # First chunk - set the complete guardrailed chain of thought
+                        source.reasoning_content = guardrail_map[reasoning_key]
+                        already_set[reasoning_key] = True
+                    else:
+                        # Subsequent chunks - clear the chain of thought
+                        source.reasoning_content = ""
 
                 if content is None:
                     continue
 
                 if isinstance(content, str):
                     # String content
-                    str_key: tuple[int, int | None] = (choice_idx_in_response, None)
+                    str_key: OutputWriteBackTarget = ChoiceContentTarget(choice_idx_in_response, None)
                     if str_key in guardrail_map:
                         if str_key not in already_set:
                             # First chunk - set the complete guardrailed text
-                            if isinstance(choice, litellm.StreamingChoices):
-                                choice.delta.content = guardrail_map[str_key]
-                            elif isinstance(choice, litellm.Choices):
-                                choice.message.content = guardrail_map[str_key]
+                            source.content = guardrail_map[str_key]
                             already_set[str_key] = True
                         else:
                             # Subsequent chunks - clear the content
-                            if isinstance(choice, litellm.StreamingChoices):
-                                choice.delta.content = ""
-                            elif isinstance(choice, litellm.Choices):
-                                choice.message.content = ""
+                            source.content = ""
 
                 elif isinstance(content, list):
                     # List content - handle each content item
                     for content_idx, content_item in enumerate(content):
                         if "text" in content_item:
-                            list_key: tuple[int, int | None] = (
-                                choice_idx_in_response,
-                                content_idx,
-                            )
+                            list_key: OutputWriteBackTarget = ChoiceContentTarget(choice_idx_in_response, content_idx)
                             if list_key in guardrail_map:
                                 if list_key not in already_set:
                                     # First chunk - set the complete guardrailed text

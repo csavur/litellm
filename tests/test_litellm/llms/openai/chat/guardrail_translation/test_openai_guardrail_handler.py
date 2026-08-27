@@ -12,16 +12,20 @@ import pytest
 
 
 from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.llms.base_llm.guardrail_translation.base_translation import StreamTransformSink
 from litellm.llms.openai.chat.guardrail_translation.handler import (
     OpenAIChatCompletionsHandler,
 )
 from litellm.types.utils import (
     ChatCompletionMessageToolCall,
     Choices,
+    Delta,
     Function,
     GenericGuardrailAPIInputs,
     Message,
     ModelResponse,
+    ModelResponseStream,
+    StreamingChoices,
 )
 
 
@@ -1559,3 +1563,207 @@ class TestScanOnlyToolResults:
         assert data["messages"][3]["content"] == "page says [BLOCKED] here"
         assert data["messages"][3]["tool_call_id"] == "call_1"
         assert data["messages"][4]["content"] == "and then?"
+
+
+class ReasoningRedactionGuardrail(CustomGuardrail):
+    """Masks a secret in every scanned text so write-back is observable per target."""
+
+    def __init__(self, guardrail_name: str = "reasoning-redactor"):
+        super().__init__(guardrail_name=guardrail_name)
+        self.scanned_texts: list[list[str]] = []
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Any | None = None,
+    ) -> GenericGuardrailAPIInputs:
+        texts = list(inputs.get("texts", []))
+        self.scanned_texts.append(texts)
+        return GenericGuardrailAPIInputs(texts=[text.replace("SECRET", "[MASKED]") for text in texts])
+
+
+class BlockingGuardrail(CustomGuardrail):
+    """Blocks whenever any scanned text contains the trigger."""
+
+    def __init__(self, trigger: str = "SECRET"):
+        super().__init__(guardrail_name="blocker")
+        self.trigger = trigger
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Any | None = None,
+    ) -> GenericGuardrailAPIInputs:
+        if any(self.trigger in text for text in inputs.get("texts", [])):
+            raise ValueError("blocked by guardrail")
+        return GenericGuardrailAPIInputs(texts=list(inputs.get("texts", [])))
+
+
+def _reasoning_response(
+    content: str | None = "the answer is SECRET",
+    reasoning_content: str | None = "the user asked about SECRET, let me repeat it",
+    thinking_blocks: list[dict[str, Any]] | None = None,
+) -> ModelResponse:
+    message_kwargs: dict[str, Any] = {"content": content, "role": "assistant"}
+    if reasoning_content is not None:
+        message_kwargs["reasoning_content"] = reasoning_content
+    if thinking_blocks is not None:
+        message_kwargs["thinking_blocks"] = thinking_blocks
+    return ModelResponse(
+        id="chatcmpl-reasoning",
+        created=1234567890,
+        model="claude-sonnet-4-5",
+        object="chat.completion",
+        choices=[Choices(finish_reason="stop", index=0, message=Message(**message_kwargs))],
+    )
+
+
+class TestOpenAIChatCompletionsHandlerReasoningOutput:
+    """The model's chain of thought must reach the guardrail and accept write-back."""
+
+    @pytest.mark.asyncio
+    async def test_reasoning_content_and_thinking_blocks_are_scanned_and_masked(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = ReasoningRedactionGuardrail()
+        response = _reasoning_response(
+            thinking_blocks=[
+                {"type": "thinking", "thinking": "SECRET is the answer", "signature": "sig-1"},
+                {"type": "redacted_thinking", "data": "encrypted-blob"},
+            ],
+        )
+
+        await handler.process_output_response(response, guardrail)
+
+        assert guardrail.scanned_texts == [
+            [
+                "the user asked about SECRET, let me repeat it",
+                "SECRET is the answer",
+                "the answer is SECRET",
+            ]
+        ], "reasoning_content and every thinking block must be sent to the guardrail alongside the content"
+
+        message = response.choices[0].message
+        assert message.reasoning_content == "the user asked about [MASKED], let me repeat it"
+        assert message.thinking_blocks[0]["thinking"] == "[MASKED] is the answer"
+        assert message.thinking_blocks[0]["signature"] == "sig-1"
+        assert message.thinking_blocks[1] == {"type": "redacted_thinking", "data": "encrypted-blob"}
+        assert message.content == "the answer is [MASKED]"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_response_is_still_scanned(self):
+        """A response whose only text is the chain of thought must not skip the guardrail."""
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = ReasoningRedactionGuardrail()
+        response = _reasoning_response(content=None)
+
+        await handler.process_output_response(response, guardrail)
+
+        assert guardrail.scanned_texts == [["the user asked about SECRET, let me repeat it"]]
+        assert response.choices[0].message.reasoning_content == "the user asked about [MASKED], let me repeat it"
+
+    @pytest.mark.asyncio
+    async def test_guardrail_blocks_on_reasoning_alone(self):
+        handler = OpenAIChatCompletionsHandler()
+        response = _reasoning_response(content="here you go", reasoning_content="I will reveal the SECRET")
+
+        with pytest.raises(ValueError, match="blocked by guardrail"):
+            await handler.process_output_response(response, BlockingGuardrail())
+
+    @pytest.mark.asyncio
+    async def test_response_without_reasoning_sends_only_content(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = ReasoningRedactionGuardrail()
+        response = _reasoning_response(reasoning_content=None)
+
+        await handler.process_output_response(response, guardrail)
+
+        assert guardrail.scanned_texts == [["the answer is SECRET"]]
+        assert response.choices[0].message.content == "the answer is [MASKED]"
+
+
+def _reasoning_chunk(
+    reasoning_content: str | None = None,
+    content: str | None = None,
+    index: int = 0,
+) -> ModelResponseStream:
+    delta_kwargs: dict[str, Any] = {"content": content, "role": "assistant"}
+    if reasoning_content is not None:
+        delta_kwargs["reasoning_content"] = reasoning_content
+    return ModelResponseStream(
+        id="chatcmpl-stream",
+        created=1234567890,
+        model="claude-sonnet-4-5",
+        choices=[StreamingChoices(index=index, delta=Delta(**delta_kwargs), finish_reason=None)],
+    )
+
+
+class TestOpenAIChatCompletionsHandlerReasoningStreaming:
+    """Mid-stream chain of thought must reach the guardrail before the stream ends."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_reasoning_deltas_are_combined_and_scanned(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = ReasoningRedactionGuardrail()
+        chunks = [
+            _reasoning_chunk(reasoning_content="the SEC"),
+            _reasoning_chunk(reasoning_content="RET is 42"),
+        ]
+
+        await handler.process_output_streaming_response(responses_so_far=chunks, guardrail_to_apply=guardrail)
+
+        assert guardrail.scanned_texts == [["the SECRET is 42"]], (
+            "reasoning deltas must be accumulated into one text per choice before scanning"
+        )
+        assert chunks[0].choices[0].delta.reasoning_content == "the [MASKED] is 42"
+        assert chunks[1].choices[0].delta.reasoning_content == ""
+
+    @pytest.mark.asyncio
+    async def test_streaming_blocks_on_reasoning_before_any_content(self):
+        handler = OpenAIChatCompletionsHandler()
+        chunks = [_reasoning_chunk(reasoning_content="I will leak the SECRET")]
+
+        with pytest.raises(ValueError, match="blocked by guardrail"):
+            await handler.process_output_streaming_response(
+                responses_so_far=chunks, guardrail_to_apply=BlockingGuardrail()
+            )
+
+    @pytest.mark.asyncio
+    async def test_streaming_transform_appends_reasoning_without_shifting_content(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = ReasoningRedactionGuardrail()
+        sink = StreamTransformSink()
+        chunks = [
+            _reasoning_chunk(reasoning_content="thinking about SECRET"),
+            _reasoning_chunk(content="the answer is SECRET"),
+        ]
+
+        await handler.process_output_streaming_response(
+            responses_so_far=chunks,
+            guardrail_to_apply=guardrail,
+            stream_transform_sink=sink,
+        )
+
+        assert guardrail.scanned_texts == [["the answer is SECRET", "thinking about SECRET"]], (
+            "the chain of thought must be appended after the content texts so choice indices stay aligned"
+        )
+        assert sink.mutated_text_per_choice == {0: "the answer is [MASKED]"}
+
+    @pytest.mark.asyncio
+    async def test_streaming_transform_scans_reasoning_before_any_content(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = ReasoningRedactionGuardrail()
+        sink = StreamTransformSink()
+        chunks = [_reasoning_chunk(reasoning_content="thinking about SECRET")]
+
+        await handler.process_output_streaming_response(
+            responses_so_far=chunks,
+            guardrail_to_apply=guardrail,
+            stream_transform_sink=sink,
+        )
+
+        assert guardrail.scanned_texts == [["thinking about SECRET"]]
+        assert sink.mutated_text_per_choice == {}, "no content has streamed yet, so nothing is transformed"
